@@ -512,17 +512,9 @@ where
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
 
                 // auth switch
-                //
-                // Ferrolap fork: also switch when a CLIENT_PLUGIN_AUTH client
-                // already answered for a different plugin (for example a MySQL
-                // 8.x client defaulting to caching_sha2_password). Upstream only
-                // switched when the first auth response was empty.
                 if !auth_plugin_expect.is_empty()
+                    && auth_response.is_empty()
                     && handshake.auth_plugin != auth_plugin_expect.as_bytes()
-                    && (auth_response.is_empty()
-                        || handshake
-                            .capabilities
-                            .contains(CapabilityFlags::CLIENT_PLUGIN_AUTH))
                 {
                     self.writer.set_seq(seq + 1);
                     self.writer.write_all(&[0xfe])?;

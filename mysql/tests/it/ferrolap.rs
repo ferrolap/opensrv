@@ -173,15 +173,15 @@ async fn failed_authentication_is_1045_access_denied() {
 }
 
 #[tokio::test]
-async fn auth_switch_also_runs_when_the_client_answered_another_plugin() {
+async fn auth_switch_still_follows_the_upstream_rule() {
     let (port, calls) = start().await;
     let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
     let _greeting = read_packet(&mut stream).await;
-    // A MySQL 8.x client answers the greeting for caching_sha2_password.
+    // Another plugin with an empty first response: upstream switches.
     write_packet(
         &mut stream,
         1,
-        &handshake_response("caching_sha2_password", &[0x99; 32]),
+        &handshake_response("caching_sha2_password", &[]),
     )
     .await;
     let (seq, payload) = read_packet(&mut stream).await;
