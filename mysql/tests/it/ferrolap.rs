@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, InitWriter, ParamParser,
-    QueryResultWriter, StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, DisconnectHook, InitWriter,
+    IntermediaryOptions, ParamParser, QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -638,4 +638,234 @@ async fn flush_pending_more_sends_the_previous_terminator_immediately() {
     assert_eq!(ok2[1], 2);
     let status = u16::from_le_bytes([ok2[3], ok2[4]]);
     assert_eq!(status & 0x0008, 0);
+}
+
+/// `slow` waits until either the disconnect hook or the test releases it and
+/// records which one happened; other queries complete immediately.
+struct DisconnectShim {
+    cancel: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    entered: Arc<tokio::sync::Notify>,
+    log: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for DisconnectShim {
+    type Error = io::Error;
+
+    fn salt(&self) -> [u8; 20] {
+        SHIM_SALT
+    }
+
+    async fn authenticate(
+        &self,
+        _auth_plugin: &str,
+        _username: &[u8],
+        _salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        auth_data == [0x42; 20]
+    }
+
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _query: &'a str,
+        info: StatementMetaWriter<'a, W>,
+    ) -> io::Result<()> {
+        info.reply(1, &[], &[]).await
+    }
+
+    async fn on_execute<'a>(
+        &'a mut self,
+        _id: u32,
+        _params: ParamParser<'a>,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        results.completed(Default::default()).await
+    }
+
+    async fn on_close<'a>(&'a mut self, _stmt: u32)
+    where
+        W: 'async_trait,
+    {
+    }
+
+    async fn on_query<'a>(
+        &'a mut self,
+        query: &'a str,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        if query == "slow" {
+            self.entered.notify_one();
+            let outcome = tokio::select! {
+                _ = self.cancel.notified() => "slow:cancelled",
+                _ = self.release.notified() => "slow:done",
+            };
+            self.log.lock().unwrap().push(outcome.to_owned());
+        } else {
+            self.log.lock().unwrap().push(query.to_owned());
+        }
+        results.completed(Default::default()).await
+    }
+
+    async fn on_init<'a>(
+        &'a mut self,
+        _schema: &'a str,
+        writer: InitWriter<'a, W>,
+    ) -> io::Result<()> {
+        writer.ok().await
+    }
+}
+
+struct DisconnectHarness {
+    port: u16,
+    fired: Arc<std::sync::atomic::AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
+    entered: Arc<tokio::sync::Notify>,
+    log: Arc<Mutex<Vec<String>>>,
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn start_disconnect_shim() -> DisconnectHarness {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let cancel = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (done_tx, done) = tokio::sync::oneshot::channel();
+    let hook = {
+        let fired = Arc::clone(&fired);
+        let cancel = Arc::clone(&cancel);
+        DisconnectHook::new(move || {
+            fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            cancel.notify_one();
+        })
+    };
+    let shim = DisconnectShim {
+        cancel,
+        release: Arc::clone(&release),
+        entered: Arc::clone(&entered),
+        log: Arc::clone(&log),
+    };
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, write) = stream.into_split();
+        let opts = IntermediaryOptions {
+            on_disconnect: Some(hook),
+            ..Default::default()
+        };
+        let _ = AsyncMysqlIntermediary::run_with_options(shim, read, write, &opts).await;
+        let _ = done_tx.send(());
+    });
+    DisconnectHarness {
+        port,
+        fired,
+        release,
+        entered,
+        log,
+        done,
+    }
+}
+
+async fn login_for_queries(port: u16) -> TcpStream {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _greeting = read_packet(&mut stream).await;
+    let caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+    let first = handshake_response_with(caps, "u", "mysql_native_password", &[0x42; 20]);
+    write_packet(&mut stream, 1, &first).await;
+    let (_seq, payload) = read_packet(&mut stream).await;
+    assert_eq!(payload[0], 0x00);
+    stream
+}
+
+fn frame(seq: u8, payload: &[u8]) -> Vec<u8> {
+    let mut out = (payload.len() as u32).to_le_bytes().to_vec();
+    out[3] = seq;
+    out.extend_from_slice(payload);
+    out
+}
+
+fn com_query(sql: &str) -> Vec<u8> {
+    let mut body = vec![0x03];
+    body.extend_from_slice(sql.as_bytes());
+    frame(0, &body)
+}
+
+async fn wait_done(done: tokio::sync::oneshot::Receiver<()>) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), done)
+        .await
+        .expect("connection did not end")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disconnect_hook_fires_when_the_client_closes_during_a_query() {
+    let h = start_disconnect_shim().await;
+    let mut stream = login_for_queries(h.port).await;
+    stream.write_all(&com_query("slow")).await.unwrap();
+    h.entered.notified().await;
+    drop(stream);
+    wait_done(h.done).await;
+    assert_eq!(h.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(*h.log.lock().unwrap(), vec!["slow:cancelled".to_owned()]);
+}
+
+#[tokio::test]
+async fn disconnect_hook_fires_on_a_buffered_com_quit() {
+    let h = start_disconnect_shim().await;
+    let mut stream = login_for_queries(h.port).await;
+    stream.write_all(&com_query("slow")).await.unwrap();
+    h.entered.notified().await;
+    stream.write_all(&frame(0, &[0x01])).await.unwrap();
+    // The server then reads the buffered COM_QUIT and closes the connection.
+    wait_done(h.done).await;
+    assert_eq!(h.fired.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(*h.log.lock().unwrap(), vec!["slow:cancelled".to_owned()]);
+    let _ = stream.read_to_end(&mut Vec::new()).await;
+}
+
+#[tokio::test]
+async fn pipelined_query_does_not_fire_the_hook_and_still_runs() {
+    let h = start_disconnect_shim().await;
+    let mut stream = login_for_queries(h.port).await;
+    let mut both = com_query("slow");
+    both.extend_from_slice(&com_query("next"));
+    stream.write_all(&both).await.unwrap();
+    h.entered.notified().await;
+    // Give read-ahead time to see the pipelined packet; it must not cancel.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    h.release.notify_one();
+    let (_seq, ok1) = read_packet(&mut stream).await;
+    assert_eq!(ok1[0], 0x00);
+    let (_seq, ok2) = read_packet(&mut stream).await;
+    assert_eq!(ok2[0], 0x00);
+    assert_eq!(h.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(
+        *h.log.lock().unwrap(),
+        vec!["slow:done".to_owned(), "next".to_owned()]
+    );
+    // After pipelined data read-ahead stops, so a later close is not reported
+    // during this query; it ends the connection normally afterwards.
+    drop(stream);
+    wait_done(h.done).await;
+    assert_eq!(h.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn pipelined_data_followed_by_close_is_not_reported_during_the_query() {
+    let h = start_disconnect_shim().await;
+    let mut stream = login_for_queries(h.port).await;
+    let mut both = com_query("slow");
+    both.extend_from_slice(&com_query("next"));
+    stream.write_all(&both).await.unwrap();
+    h.entered.notified().await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    drop(stream);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(h.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+    h.release.notify_one();
+    wait_done(h.done).await;
+    assert_eq!(h.log.lock().unwrap()[0], "slow:done");
 }

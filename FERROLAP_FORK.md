@@ -46,6 +46,17 @@ Modified files: `mysql/src/lib.rs`, `mysql/src/commands.rs`, `mysql/src/resultse
    `QueryResultWriter::flush_pending_more` writes the deferred terminator of the
    previous resultset immediately (with `SERVER_MORE_RESULTS_EXISTS`), so a
    multi-statement batch sees a write failure before running the next statement.
+5. **Disconnect detection while a query runs.** `IntermediaryOptions::on_disconnect`
+   takes an optional `DisconnectHook` (a generic callback; no dependency on the
+   embedding project). When set, the command loop reads ahead on the input
+   stream while `on_query` runs and appends the bytes to its own packet buffer
+   (no peek, no separate buffer, at most 4 KiB). The hook fires at most once per
+   query, only on EOF (FIN), a connection reset / abort / broken pipe error, or
+   a complete `COM_QUIT` packet at the head of the buffer. Any other pipelined
+   bytes are kept for the next command, do not fire the hook, and stop
+   read-ahead for the rest of that query. The query future is never dropped by
+   the intermediary; the shim decides how to stop. Write failures are returned
+   to the shim as before. With `on_disconnect: None` behaviour is unchanged.
 
 Tests for these changes: `mysql/tests/it/ferrolap.rs`
 (`cargo test -p opensrv-mysql --test it ferrolap`).

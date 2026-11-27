@@ -145,6 +145,84 @@ impl<R: AsyncRead + Unpin> AsyncRead for PacketReader<R> {
     }
 }
 
+/// Upper bound on bytes that read-ahead may hold in the packet buffer while a
+/// query is executing. Read-ahead also stops as soon as the buffered bytes can no
+/// longer be a `COM_QUIT` packet, so in practice the buffer grows by one read.
+pub(crate) const READ_AHEAD_LIMIT: usize = 4_096;
+
+/// Outcome of one read-ahead step while a query is executing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadAhead {
+    /// The peer is gone: EOF (FIN) or a connection reset / abort / broken pipe.
+    Disconnected,
+    /// A complete `COM_QUIT` packet is at the head of the buffer.
+    Quit,
+    /// The buffered bytes might still become a `COM_QUIT` packet; read again.
+    More,
+    /// Pipelined data, the buffer limit, or another I/O error: stop reading
+    /// ahead for the rest of this query and do not report a disconnect.
+    Stop,
+}
+
+/// Classify buffered bytes for read-ahead: `Some(Quit)`, `Some(Stop)`, or
+/// `None` when more bytes are needed to decide.
+fn classify_read_ahead(bytes: &[u8]) -> Option<ReadAhead> {
+    // A COM_QUIT packet is exactly: length 1 (u24 LE), any sequence id, 0x01.
+    const QUIT_LEN: [u8; 3] = [0x01, 0x00, 0x00];
+    if bytes.len() < 3 {
+        return if QUIT_LEN.starts_with(bytes) {
+            None
+        } else {
+            Some(ReadAhead::Stop)
+        };
+    }
+    if bytes[..3] != QUIT_LEN {
+        return Some(ReadAhead::Stop);
+    }
+    match bytes.get(4) {
+        None => None,
+        Some(0x01) => Some(ReadAhead::Quit),
+        Some(_) => Some(ReadAhead::Stop),
+    }
+}
+
+impl<R: AsyncRead + Unpin> PacketReader<R> {
+    /// Read ahead while a query is executing, appending any bytes to the packet
+    /// buffer so that the next [`Self::next_async`] sees them unchanged.
+    ///
+    /// Cancel safe: the buffer is only modified after the read completes, so
+    /// dropping the future at its await point loses no data.
+    pub(crate) async fn read_ahead(&mut self) -> ReadAhead {
+        if let Some(outcome) = classify_read_ahead(&self.bytes) {
+            return outcome;
+        }
+        let room = READ_AHEAD_LIMIT.saturating_sub(self.bytes.len());
+        if room == 0 {
+            return ReadAhead::Stop;
+        }
+        let mut chunk = [0u8; 512];
+        let want = room.min(chunk.len());
+        match self.r.read(&mut chunk[..want]).await {
+            Ok(0) => ReadAhead::Disconnected,
+            Ok(n) => {
+                let mut buf = BytesMut::with_capacity(self.bytes.len() + n);
+                buf.extend_from_slice(&self.bytes);
+                buf.extend_from_slice(&chunk[..n]);
+                self.bytes = buf.freeze();
+                classify_read_ahead(&self.bytes).unwrap_or(ReadAhead::More)
+            }
+            Err(e) => match e.kind() {
+                io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::UnexpectedEof => ReadAhead::Disconnected,
+                _ => ReadAhead::Stop,
+            },
+        }
+    }
+}
+
 impl<R: AsyncRead + Unpin> PacketReader<R> {
     pub async fn next_async(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
         loop {
@@ -460,5 +538,61 @@ mod test {
             }
             assert_eq!(total_size, input_size);
         }
+    }
+}
+
+#[cfg(test)]
+mod read_ahead_tests {
+    use super::*;
+
+    #[test]
+    fn classify_read_ahead_only_reports_a_complete_quit() {
+        assert_eq!(classify_read_ahead(&[]), None);
+        assert_eq!(classify_read_ahead(&[0x01]), None);
+        assert_eq!(classify_read_ahead(&[0x01, 0x00, 0x00, 0x00]), None);
+        assert_eq!(
+            classify_read_ahead(&[0x01, 0x00, 0x00, 0x00, 0x01]),
+            Some(ReadAhead::Quit)
+        );
+        // COM_PING (0x0e) and a pipelined COM_QUERY are not a disconnect.
+        assert_eq!(
+            classify_read_ahead(&[0x01, 0x00, 0x00, 0x00, 0x0e]),
+            Some(ReadAhead::Stop)
+        );
+        assert_eq!(classify_read_ahead(&[0x09, 0x00]), Some(ReadAhead::Stop));
+        assert_eq!(
+            classify_read_ahead(&[0x09, 0x00, 0x00, 0x00, 0x03, b'S']),
+            Some(ReadAhead::Stop)
+        );
+        // A quit packet behind pipelined data is not looked at.
+        assert_eq!(
+            classify_read_ahead(&[
+                0x02, 0x00, 0x00, 0x00, 0x03, b'x', 0x01, 0x00, 0x00, 0x00, 0x01
+            ]),
+            Some(ReadAhead::Stop)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_ahead_keeps_bytes_for_next_async() {
+        let data: &[u8] = &[0x02, 0x00, 0x00, 0x00, 0x03, b'x'];
+        let mut reader = PacketReader::new(data);
+        assert_eq!(reader.read_ahead().await, ReadAhead::Stop);
+        assert_eq!(reader.read_ahead().await, ReadAhead::Stop);
+        let (seq, packet) = reader.next_async().await.unwrap().unwrap();
+        assert_eq!(seq, 0);
+        assert_eq!(&*packet, &[0x03, b'x']);
+        assert!(reader.next_async().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_ahead_reports_eof_and_quit() {
+        let mut reader = PacketReader::new(&[][..]);
+        assert_eq!(reader.read_ahead().await, ReadAhead::Disconnected);
+        let quit: &[u8] = &[0x01, 0x00, 0x00, 0x00, 0x01];
+        let mut reader = PacketReader::new(quit);
+        assert_eq!(reader.read_ahead().await, ReadAhead::Quit);
+        let (_seq, packet) = reader.next_async().await.unwrap().unwrap();
+        assert_eq!(&*packet, &[0x01]);
     }
 }

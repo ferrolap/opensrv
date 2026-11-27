@@ -210,6 +210,47 @@ pub trait AsyncMysqlShim<W: Send> {
     }
 }
 
+/// Callback invoked when the client is known to be gone while
+/// [`AsyncMysqlShim::on_query`] is still running.
+///
+/// While a query executes, the intermediary reads ahead on the input stream into
+/// its own packet buffer (no peek). The hook fires at most once per query, and
+/// only when the read returns EOF, fails with a connection reset / abort /
+/// broken pipe error, or a complete `COM_QUIT` packet is buffered. Pipelined
+/// data is kept for the next command and does not fire the hook; read-ahead then
+/// stops for the rest of that query. The buffer is capped. Write failures are
+/// returned to the shim as I/O errors as before and do not fire the hook.
+///
+/// The hook should be cheap and non-blocking, for example cancelling a token
+/// that the shim's query execution watches.
+#[derive(Clone)]
+pub struct DisconnectHook(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl DisconnectHook {
+    /// Wrap a callback.
+    pub fn new(callback: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(callback))
+    }
+
+    fn fire(&self) {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for DisconnectHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DisconnectHook")
+    }
+}
+
+impl PartialEq for DisconnectHook {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for DisconnectHook {}
+
 /// The options which passed to AsyncMysqlIntermediary struct
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IntermediaryOptions {
@@ -217,6 +258,9 @@ pub struct IntermediaryOptions {
     pub process_use_statement_on_query: bool,
     /// reject connection if dbname not provided
     pub reject_connection_on_dbname_absence: bool,
+    /// Ferrolap fork: detect a client disconnect while `on_query` runs. `None`
+    /// keeps the upstream behaviour (no read-ahead).
+    pub on_disconnect: Option<DisconnectHook>,
 }
 
 #[derive(Default)]
@@ -234,6 +278,7 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     pub(crate) client_capabilities: CapabilityFlags,
     process_use_statement_on_query: bool,
     reject_connection_on_dbname_absence: bool,
+    on_disconnect: Option<DisconnectHook>,
     shim: B,
     reader: packet_reader::PacketReader<S>,
     writer: packet_writer::PacketWriter<W>,
@@ -287,6 +332,7 @@ where
             client_capabilities,
             process_use_statement_on_query,
             reject_connection_on_dbname_absence,
+            on_disconnect: opts.on_disconnect.clone(),
             shim,
             reader,
             writer,
@@ -634,6 +680,52 @@ where
         Ok(())
     }
 
+    /// Run `on_query` while reading ahead on the input stream (Ferrolap fork).
+    ///
+    /// See [`DisconnectHook`] for when the hook fires. The query future is
+    /// always polled first and is never dropped early; the shim decides how to
+    /// stop once the hook has fired.
+    async fn on_query_watched(
+        &mut self,
+        query: &str,
+        hook: DisconnectHook,
+    ) -> Result<(), B::Error> {
+        use packet_reader::ReadAhead;
+        use std::future::Future;
+        use std::task::Poll;
+
+        let writer = QueryResultWriter::new(&mut self.writer, false, self.client_capabilities);
+        let mut query_fut = std::pin::pin!(self.shim.on_query(query, writer));
+        let reader = &mut self.reader;
+        let mut watch = std::pin::pin!(async move {
+            loop {
+                match reader.read_ahead().await {
+                    ReadAhead::More => continue,
+                    ReadAhead::Disconnected | ReadAhead::Quit => {
+                        hook.fire();
+                        return;
+                    }
+                    ReadAhead::Stop => return,
+                }
+            }
+        });
+        let mut watching = true;
+        std::future::poll_fn(|cx| {
+            if let Poll::Ready(result) = query_fut.as_mut().poll(cx) {
+                return Poll::Ready(result);
+            }
+            if watching && watch.as_mut().poll(cx).is_ready() {
+                watching = false;
+                // The hook may have woken the query; poll it again now.
+                if let Poll::Ready(result) = query_fut.as_mut().poll(cx) {
+                    return Poll::Ready(result);
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
     async fn run(mut self) -> Result<(), B::Error> {
         use crate::commands::Command;
 
@@ -669,14 +761,17 @@ where
                                         w.finish().await?;
                                     }
                                     _ => {
-                                        self.shim
-                                            .on_query(
-                                                ::std::str::from_utf8(q).map_err(|e| {
-                                                    io::Error::new(io::ErrorKind::InvalidData, e)
-                                                })?,
-                                                w,
-                                            )
-                                            .await?;
+                                        let query = ::std::str::from_utf8(q).map_err(|e| {
+                                            io::Error::new(io::ErrorKind::InvalidData, e)
+                                        })?;
+                                        match self.on_disconnect.clone() {
+                                            Some(hook) => {
+                                                drop(w);
+                                                let query = query.to_owned();
+                                                self.on_query_watched(&query, hook).await?;
+                                            }
+                                            None => self.shim.on_query(query, w).await?,
+                                        }
                                     }
                                 }
                             } else if !self.process_use_statement_on_query
@@ -691,19 +786,22 @@ where
                                 let schema = schema.trim().trim_end_matches(';').trim_matches('`');
                                 self.shim.on_init(schema, w).await?;
                             } else {
-                                let w = QueryResultWriter::new(
-                                    &mut self.writer,
-                                    false,
-                                    self.client_capabilities,
-                                );
-                                self.shim
-                                    .on_query(
-                                        ::std::str::from_utf8(q).map_err(|e| {
-                                            io::Error::new(io::ErrorKind::InvalidData, e)
-                                        })?,
-                                        w,
-                                    )
-                                    .await?;
+                                let query = ::std::str::from_utf8(q)
+                                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                                match self.on_disconnect.clone() {
+                                    Some(hook) => {
+                                        let query = query.to_owned();
+                                        self.on_query_watched(&query, hook).await?;
+                                    }
+                                    None => {
+                                        let w = QueryResultWriter::new(
+                                            &mut self.writer,
+                                            false,
+                                            self.client_capabilities,
+                                        );
+                                        self.shim.on_query(query, w).await?;
+                                    }
+                                }
                             }
                         }
                         Command::Prepare(q) => {
