@@ -149,8 +149,13 @@ fn handshake_response_with(capabilities: u32, user: &str, plugin: &str, auth: &[
     body.extend_from_slice(&[0u8; 23]);
     body.extend_from_slice(user.as_bytes());
     body.push(0);
-    body.push(auth.len() as u8);
-    body.extend_from_slice(auth);
+    if capabilities & CLIENT_SECURE_CONNECTION != 0 {
+        body.push(auth.len() as u8);
+        body.extend_from_slice(auth);
+    } else {
+        body.extend_from_slice(auth);
+        body.push(0);
+    }
     if capabilities & CLIENT_PLUGIN_AUTH != 0 {
         body.extend_from_slice(plugin.as_bytes());
         body.push(0);
@@ -328,4 +333,45 @@ async fn native_plugin_and_no_plugin_auth_are_verified_without_switch() {
         "expected OK without a switch, got {payload:?}"
     );
     assert_eq!(calls.lock().unwrap()[0].1, vec![0x42; 20]);
+}
+
+#[tokio::test]
+async fn nul_terminated_native_first_packet_is_not_switched() {
+    let (port, calls) = start().await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _greeting = read_packet(&mut stream).await;
+    // PROTOCOL_41 + PLUGIN_AUTH, no SECURE_CONNECTION: auth data is NUL-terminated.
+    let first = handshake_response_with(
+        CLIENT_PROTOCOL_41 | CLIENT_PLUGIN_AUTH,
+        "u",
+        "mysql_native_password",
+        &[0x42; 20],
+    );
+    write_packet(&mut stream, 1, &first).await;
+    let (seq, payload) = read_packet(&mut stream).await;
+    assert_eq!(seq, 2);
+    assert_eq!(
+        payload[0], 0x00,
+        "same plugin must be verified without AuthSwitch, got {payload:?}"
+    );
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0, "mysql_native_password");
+    assert_eq!(calls[0].1, vec![0x42; 20]);
+}
+
+#[tokio::test]
+async fn nul_terminated_other_plugin_is_still_switched() {
+    let (port, calls) = start().await;
+    let first = handshake_response_with(
+        CLIENT_PROTOCOL_41 | CLIENT_PLUGIN_AUTH,
+        "u",
+        "caching_sha2_password",
+        &[0x99; 20],
+    );
+    let answer = switch_and_answer(port, first, &[0x42; 20]).await;
+    assert_eq!(answer[0], 0x00, "expected OK after switch, got {answer:?}");
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, vec![0x42; 20]);
 }

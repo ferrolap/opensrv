@@ -10,7 +10,7 @@ Ferrolap pins this fork by git revision. Branches are based on upstream commit
 
 ## Changes on `ferrolap/m5-auth` (`opensrv-mysql` only)
 
-Modified file: `mysql/src/lib.rs`.
+Modified files: `mysql/src/lib.rs`, `mysql/src/commands.rs`.
 
 1. Authentication failure is reported as `ER_ACCESS_DENIED_ERROR` (1045 / SQLSTATE 28000)
    with the text `Access denied for user '<user>' (using password: YES|NO)`, instead of
@@ -26,6 +26,10 @@ Modified file: `mysql/src/lib.rs`.
    depends only on the client's plugin name, not on the user. The request carries the
    shim's `salt()`. (Commit `f42ffc2f` widened the rule differently and was reverted in
    `a48d8682`; this replaces both.)
+   Also: when the first packet has `CLIENT_PLUGIN_AUTH` but not
+   `CLIENT_SECURE_CONNECTION`, consume the NUL that terminates the auth
+   response before parsing the database and plugin fields. Otherwise the
+   plugin name is read as empty and a native first packet is wrongly switched.
 
 Tests for these changes: `mysql/tests/it/ferrolap.rs`
 (`cargo test -p opensrv-mysql --test it ferrolap`).

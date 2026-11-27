@@ -78,7 +78,13 @@ pub fn client_handshake(i: &[u8], after_tls: bool) -> nom::IResult<&[u8], Client
                 let (i, size) = nom::number::complete::le_u8(i)?;
                 nom::bytes::complete::take(size)(i)?
             } else {
-                nom::bytes::complete::take_until(&b"\0"[..])(i)?
+                // Null-terminated auth-response (no CLIENT_SECURE_CONNECTION).
+                // Consume the trailing NUL; otherwise the plugin name and
+                // optional database are parsed from the wrong offset, and an
+                // empty plugin string would look like a different plugin.
+                let (i, auth_response) = nom::bytes::complete::take_until(&b"\0"[..])(i)?;
+                let (i, _) = nom::bytes::complete::tag(b"\0")(i)?;
+                (i, auth_response)
             };
 
         let (i, db) =
@@ -239,4 +245,74 @@ pub fn parse(i: &[u8]) -> nom::IResult<&[u8], Command<'_>> {
         map(tag(&[CommandByte::COM_QUIT as u8]), |_| Command::Quit),
         map(tag(&[CommandByte::COM_PING as u8]), |_| Command::Ping),
     ))(i)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLIENT_PROTOCOL_41: u32 = 1 << 9;
+    const CLIENT_CONNECT_WITH_DB: u32 = 1 << 3;
+    const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
+    const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
+
+    fn handshake41(
+        caps: u32,
+        user: &str,
+        auth: &[u8],
+        db: Option<&str>,
+        plugin: Option<&str>,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&caps.to_le_bytes());
+        body.extend_from_slice(&0x00FF_FFFFu32.to_le_bytes());
+        body.push(33);
+        body.extend_from_slice(&[0u8; 23]);
+        body.extend_from_slice(user.as_bytes());
+        body.push(0);
+        if caps & CLIENT_SECURE_CONNECTION != 0 {
+            body.push(auth.len() as u8);
+            body.extend_from_slice(auth);
+        } else {
+            body.extend_from_slice(auth);
+            body.push(0);
+        }
+        if let Some(db) = db {
+            body.extend_from_slice(db.as_bytes());
+            body.push(0);
+        }
+        if let Some(plugin) = plugin {
+            body.extend_from_slice(plugin.as_bytes());
+            body.push(0);
+        }
+        body
+    }
+
+    #[test]
+    fn nul_terminated_native_response_keeps_the_plugin_name() {
+        let caps = CLIENT_PROTOCOL_41 | CLIENT_PLUGIN_AUTH;
+        let packet = handshake41(caps, "u", &[0x42; 20], None, Some("mysql_native_password"));
+        let (rest, hs) = client_handshake(&packet, false).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(hs.auth_response, vec![0x42; 20]);
+        assert_eq!(hs.auth_plugin, b"mysql_native_password");
+        assert!(hs.db.is_none());
+    }
+
+    #[test]
+    fn nul_terminated_response_with_database_then_plugin() {
+        let caps = CLIENT_PROTOCOL_41 | CLIENT_CONNECT_WITH_DB | CLIENT_PLUGIN_AUTH;
+        let packet = handshake41(
+            caps,
+            "u",
+            &[0x11; 20],
+            Some("appdb"),
+            Some("caching_sha2_password"),
+        );
+        let (rest, hs) = client_handshake(&packet, false).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(hs.auth_response, vec![0x11; 20]);
+        assert_eq!(hs.db.as_deref(), Some(&b"appdb"[..]));
+        assert_eq!(hs.auth_plugin, b"caching_sha2_password");
+    }
 }
