@@ -512,10 +512,25 @@ where
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
 
                 // auth switch
-                if !auth_plugin_expect.is_empty()
-                    && auth_response.is_empty()
-                    && handshake.auth_plugin != auth_plugin_expect.as_bytes()
+                //
+                // Ferrolap fork: switch whenever the plugin the client answered
+                // for differs from the expected one, whether or not its first
+                // response is empty. The first-packet data is then discarded and
+                // only the switched answer is verified. A client without
+                // CLIENT_PLUGIN_AUTH answered for mysql_native_password. The
+                // decision depends only on the client's plugin name, never on
+                // the user. The request carries the shim's salt().
+                let client_plugin: &[u8] = if handshake
+                    .capabilities
+                    .contains(CapabilityFlags::CLIENT_PLUGIN_AUTH)
                 {
+                    &handshake.auth_plugin
+                } else {
+                    MYSQL_NATIVE_PASSWORD.as_bytes()
+                };
+                if !auth_plugin_expect.is_empty() && client_plugin != auth_plugin_expect.as_bytes()
+                {
+                    auth_response.clear();
                     self.writer.set_seq(seq + 1);
                     self.writer.write_all(&[0xfe])?;
                     self.writer.write_all(auth_plugin_expect.as_bytes())?;

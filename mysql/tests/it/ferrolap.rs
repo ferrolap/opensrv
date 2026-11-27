@@ -29,6 +29,10 @@ const CLIENT_PROTOCOL_41: u32 = 1 << 9;
 const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
 
+/// Per-connection salt the shim hands out; differs from upstream's fixed salt.
+const SHIM_SALT: [u8; 20] = *b"ferrolap-test-salt-1";
+const UPSTREAM_FIXED_SALT: &[u8; 20] = b";X,po_k}>o6^Wz!/kM}N";
+
 /// Recorded `(auth_plugin, auth_data)` pairs.
 type Calls = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
@@ -40,6 +44,10 @@ struct Shim {
 #[async_trait]
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Shim {
     type Error = io::Error;
+
+    fn salt(&self) -> [u8; 20] {
+        SHIM_SALT
+    }
 
     async fn authenticate(
         &self,
@@ -125,18 +133,56 @@ async fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) {
 }
 
 fn handshake_response(plugin: &str, auth: &[u8]) -> Vec<u8> {
-    let capabilities = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+    handshake_response_with(
+        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH,
+        "u",
+        plugin,
+        auth,
+    )
+}
+
+fn handshake_response_with(capabilities: u32, user: &str, plugin: &str, auth: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&capabilities.to_le_bytes());
     body.extend_from_slice(&0x00FF_FFFFu32.to_le_bytes());
     body.push(33);
     body.extend_from_slice(&[0u8; 23]);
-    body.extend_from_slice(b"u\0");
+    body.extend_from_slice(user.as_bytes());
+    body.push(0);
     body.push(auth.len() as u8);
     body.extend_from_slice(auth);
-    body.extend_from_slice(plugin.as_bytes());
-    body.push(0);
+    if capabilities & CLIENT_PLUGIN_AUTH != 0 {
+        body.extend_from_slice(plugin.as_bytes());
+        body.push(0);
+    }
     body
+}
+
+/// Send `first`, expect an AuthSwitchRequest carrying the shim's salt, answer
+/// with `switched`, and return the server's final packet.
+async fn switch_and_answer(port: u16, first: Vec<u8>, switched: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _greeting = read_packet(&mut stream).await;
+    write_packet(&mut stream, 1, &first).await;
+    let (seq, payload) = read_packet(&mut stream).await;
+    assert_eq!(seq, 2);
+    assert_eq!(
+        payload[0], 0xfe,
+        "expected AuthSwitchRequest, got {payload:?}"
+    );
+    let name = b"mysql_native_password\0";
+    assert!(payload[1..].starts_with(name));
+    let salt = &payload[1 + name.len()..1 + name.len() + 20];
+    assert_eq!(
+        salt,
+        SHIM_SALT.as_slice(),
+        "AuthSwitchRequest must carry salt()"
+    );
+    assert_ne!(salt, UPSTREAM_FIXED_SALT.as_slice());
+    write_packet(&mut stream, 3, switched).await;
+    let (seq, answer) = read_packet(&mut stream).await;
+    assert_eq!(seq, 4);
+    answer
 }
 
 fn errno(payload: &[u8]) -> (u16, String) {
@@ -219,4 +265,67 @@ async fn unrecognized_commands_are_1047_not_ok() {
     write_packet(&mut stream, 0, &[0x0e]).await;
     let (_, payload) = read_packet(&mut stream).await;
     assert_eq!(payload[0], 0x00, "COM_PING should still be OK");
+}
+
+#[tokio::test]
+async fn non_empty_answer_for_another_plugin_is_switched_and_discarded() {
+    for user in ["u", "unknown-user"] {
+        let (port, calls) = start().await;
+        // A MySQL 8.x style first packet: caching_sha2_password with 32 bytes.
+        // The [0x42; 20] prefix would pass if it were not discarded.
+        let mut first_data = vec![0x42; 20];
+        first_data.extend_from_slice(&[0x99; 12]);
+        let first = handshake_response_with(
+            CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH,
+            user,
+            "caching_sha2_password",
+            &first_data,
+        );
+        let answer = switch_and_answer(port, first, &[0x42; 20]).await;
+        assert_eq!(answer[0], 0x00, "{user}: expected OK, got {answer:?}");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only the switched answer is verified");
+        assert_eq!(
+            calls[0],
+            ("mysql_native_password".to_owned(), vec![0x42; 20])
+        );
+    }
+}
+
+#[tokio::test]
+async fn first_packet_data_alone_never_logs_in_after_a_switch() {
+    let (port, calls) = start().await;
+    let first = handshake_response("caching_sha2_password", &[0x42; 20]);
+    let answer = switch_and_answer(port, first, &[0x11; 20]).await;
+    assert_eq!(answer[0], 0xff);
+    assert_eq!(u16::from_le_bytes([answer[1], answer[2]]), 1045);
+    assert_eq!(calls.lock().unwrap()[0].1, vec![0x11; 20]);
+}
+
+#[tokio::test]
+async fn native_plugin_and_no_plugin_auth_are_verified_without_switch() {
+    // Same plugin name: verified directly.
+    let (port, calls) = start().await;
+    let (_stream, payload) = login(port, &[0x42; 20]).await;
+    assert_eq!(payload[0], 0x00);
+    assert_eq!(calls.lock().unwrap().len(), 1);
+
+    // No CLIENT_PLUGIN_AUTH: treated as mysql_native_password, no switch.
+    let (port, calls) = start().await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _greeting = read_packet(&mut stream).await;
+    let first = handshake_response_with(
+        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION,
+        "u",
+        "",
+        &[0x42; 20],
+    );
+    write_packet(&mut stream, 1, &first).await;
+    let (seq, payload) = read_packet(&mut stream).await;
+    assert_eq!(seq, 2);
+    assert_eq!(
+        payload[0], 0x00,
+        "expected OK without a switch, got {payload:?}"
+    );
+    assert_eq!(calls.lock().unwrap()[0].1, vec![0x42; 20]);
 }
