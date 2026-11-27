@@ -50,13 +50,16 @@ Modified files: `mysql/src/lib.rs`, `mysql/src/commands.rs`, `mysql/src/resultse
    takes an optional `DisconnectHook` (a generic callback; no dependency on the
    embedding project). When set, the command loop reads ahead on the input
    stream while `on_query` runs and appends the bytes to its own packet buffer
-   (no peek, no separate buffer, at most 4 KiB). The hook fires at most once per
-   query, only on EOF (FIN), a connection reset / abort / broken pipe error, or
-   a complete `COM_QUIT` packet at the head of the buffer. Any other pipelined
-   bytes are kept for the next command, do not fire the hook, and stop
-   read-ahead for the rest of that query. The query future is never dropped by
-   the intermediary; the shim decides how to stop. Write failures are returned
-   to the shim as before. With `on_disconnect: None` behaviour is unchanged.
+   (no peek, no separate buffer; an append never grows it past 4 KiB). The hook
+   fires at most once per query, only on EOF (FIN), a connection reset / abort /
+   broken pipe error, or a complete `COM_QUIT` packet at the head of the buffer.
+   Any other pipelined bytes, including an incomplete packet, are kept for the
+   next command, do not fire the hook, and stop read-ahead for the rest of that
+   query. The query future is never dropped by the intermediary; the shim
+   decides how to stop. Once the hook has fired, the command loop ends when
+   `on_query` returns, without flushing or reading further commands. Write
+   failures are returned to the shim as before. With `on_disconnect: None`
+   behaviour is unchanged.
 
 Tests for these changes: `mysql/tests/it/ferrolap.rs`
 (`cargo test -p opensrv-mysql --test it ferrolap`).

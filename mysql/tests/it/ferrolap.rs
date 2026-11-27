@@ -830,11 +830,11 @@ async fn disconnect_hook_fires_on_a_buffered_com_quit() {
 async fn pipelined_query_does_not_fire_the_hook_and_still_runs() {
     let h = start_disconnect_shim().await;
     let mut stream = login_for_queries(h.port).await;
-    let mut both = com_query("slow");
-    both.extend_from_slice(&com_query("next"));
-    stream.write_all(&both).await.unwrap();
+    stream.write_all(&com_query("slow")).await.unwrap();
     h.entered.notified().await;
-    // Give read-ahead time to see the pipelined packet; it must not cancel.
+    // Sent while "slow" runs, so read-ahead reads it from the socket. It must
+    // not cancel.
+    stream.write_all(&com_query("next")).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     h.release.notify_one();
     let (_seq, ok1) = read_packet(&mut stream).await;
@@ -857,10 +857,9 @@ async fn pipelined_query_does_not_fire_the_hook_and_still_runs() {
 async fn pipelined_data_followed_by_close_is_not_reported_during_the_query() {
     let h = start_disconnect_shim().await;
     let mut stream = login_for_queries(h.port).await;
-    let mut both = com_query("slow");
-    both.extend_from_slice(&com_query("next"));
-    stream.write_all(&both).await.unwrap();
+    stream.write_all(&com_query("slow")).await.unwrap();
     h.entered.notified().await;
+    stream.write_all(&com_query("next")).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     drop(stream);
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -868,4 +867,24 @@ async fn pipelined_data_followed_by_close_is_not_reported_during_the_query() {
     h.release.notify_one();
     wait_done(h.done).await;
     assert_eq!(h.log.lock().unwrap()[0], "slow:done");
+}
+
+#[tokio::test]
+async fn incomplete_packet_stops_read_ahead_without_firing() {
+    let h = start_disconnect_shim().await;
+    let mut stream = login_for_queries(h.port).await;
+    stream.write_all(&com_query("slow")).await.unwrap();
+    h.entered.notified().await;
+    // Header of a possible COM_QUIT without its body: not a disconnect.
+    stream.write_all(&[0x01, 0x00, 0x00, 0x00]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    stream.write_all(&[0x01]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(h.fired.load(std::sync::atomic::Ordering::SeqCst), 0);
+    h.release.notify_one();
+    let (_seq, ok) = read_packet(&mut stream).await;
+    assert_eq!(ok[0], 0x00);
+    // The completed COM_QUIT is then handled as a normal command.
+    wait_done(h.done).await;
+    assert_eq!(*h.log.lock().unwrap(), vec!["slow:done".to_owned()]);
 }

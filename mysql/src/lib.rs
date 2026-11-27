@@ -216,10 +216,14 @@ pub trait AsyncMysqlShim<W: Send> {
 /// While a query executes, the intermediary reads ahead on the input stream into
 /// its own packet buffer (no peek). The hook fires at most once per query, and
 /// only when the read returns EOF, fails with a connection reset / abort /
-/// broken pipe error, or a complete `COM_QUIT` packet is buffered. Pipelined
-/// data is kept for the next command and does not fire the hook; read-ahead then
-/// stops for the rest of that query. The buffer is capped. Write failures are
-/// returned to the shim as I/O errors as before and do not fire the hook.
+/// broken pipe error, or a complete `COM_QUIT` packet is buffered. Any other
+/// pipelined bytes, including an incomplete packet, are kept for the next
+/// command and do not fire the hook; read-ahead then stops for the rest of that
+/// query. Read-ahead appends are capped. Write failures are returned to the shim
+/// as I/O errors as before and do not fire the hook.
+///
+/// Once the hook has fired, the command loop ends as soon as `on_query`
+/// returns, without flushing or reading further commands.
 ///
 /// The hook should be cheap and non-blocking, for example cancelling a token
 /// that the shim's query execution watches.
@@ -685,11 +689,13 @@ where
     /// See [`DisconnectHook`] for when the hook fires. The query future is
     /// always polled first and is never dropped early; the shim decides how to
     /// stop once the hook has fired.
+    ///
+    /// Returns whether the hook fired.
     async fn on_query_watched(
         &mut self,
         query: &str,
         hook: DisconnectHook,
-    ) -> Result<(), B::Error> {
+    ) -> Result<bool, B::Error> {
         use packet_reader::ReadAhead;
         use std::future::Future;
         use std::task::Poll;
@@ -698,32 +704,34 @@ where
         let mut query_fut = std::pin::pin!(self.shim.on_query(query, writer));
         let reader = &mut self.reader;
         let mut watch = std::pin::pin!(async move {
-            loop {
-                match reader.read_ahead().await {
-                    ReadAhead::More => continue,
-                    ReadAhead::Disconnected | ReadAhead::Quit => {
-                        hook.fire();
-                        return;
-                    }
-                    ReadAhead::Stop => return,
+            match reader.read_ahead().await {
+                ReadAhead::Disconnected | ReadAhead::Quit => {
+                    hook.fire();
+                    true
                 }
+                ReadAhead::Stop => false,
             }
         });
         let mut watching = true;
-        std::future::poll_fn(|cx| {
+        let mut fired = false;
+        let result = std::future::poll_fn(|cx| {
             if let Poll::Ready(result) = query_fut.as_mut().poll(cx) {
                 return Poll::Ready(result);
             }
-            if watching && watch.as_mut().poll(cx).is_ready() {
-                watching = false;
-                // The hook may have woken the query; poll it again now.
-                if let Poll::Ready(result) = query_fut.as_mut().poll(cx) {
-                    return Poll::Ready(result);
+            if watching {
+                if let Poll::Ready(hook_fired) = watch.as_mut().poll(cx) {
+                    watching = false;
+                    fired = hook_fired;
+                    // The hook may have woken the query; poll it again now.
+                    if let Poll::Ready(result) = query_fut.as_mut().poll(cx) {
+                        return Poll::Ready(result);
+                    }
                 }
             }
             Poll::Pending
         })
-        .await
+        .await;
+        result.map(|()| fired)
     }
 
     async fn run(mut self) -> Result<(), B::Error> {
@@ -768,7 +776,10 @@ where
                                             Some(hook) => {
                                                 drop(w);
                                                 let query = query.to_owned();
-                                                self.on_query_watched(&query, hook).await?;
+                                                if self.on_query_watched(&query, hook).await? {
+                                                    // The client is gone or quitting.
+                                                    return Ok(());
+                                                }
                                             }
                                             None => self.shim.on_query(query, w).await?,
                                         }
@@ -791,7 +802,10 @@ where
                                 match self.on_disconnect.clone() {
                                     Some(hook) => {
                                         let query = query.to_owned();
-                                        self.on_query_watched(&query, hook).await?;
+                                        if self.on_query_watched(&query, hook).await? {
+                                            // The client is gone or quitting.
+                                            return Ok(());
+                                        }
                                     }
                                     None => {
                                         let w = QueryResultWriter::new(

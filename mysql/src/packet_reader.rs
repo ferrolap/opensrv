@@ -145,9 +145,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for PacketReader<R> {
     }
 }
 
-/// Upper bound on bytes that read-ahead may hold in the packet buffer while a
-/// query is executing. Read-ahead also stops as soon as the buffered bytes can no
-/// longer be a `COM_QUIT` packet, so in practice the buffer grows by one read.
+/// Upper bound on the buffered bytes after a read-ahead append while a query is
+/// executing. Read-ahead also stops at the first buffered bytes that are not a
+/// complete `COM_QUIT` packet, so in practice it appends at most one read.
 pub(crate) const READ_AHEAD_LIMIT: usize = 4_096;
 
 /// Outcome of one read-ahead step while a query is executing.
@@ -157,32 +157,24 @@ pub(crate) enum ReadAhead {
     Disconnected,
     /// A complete `COM_QUIT` packet is at the head of the buffer.
     Quit,
-    /// The buffered bytes might still become a `COM_QUIT` packet; read again.
-    More,
-    /// Pipelined data, the buffer limit, or another I/O error: stop reading
-    /// ahead for the rest of this query and do not report a disconnect.
+    /// Pipelined data (including an incomplete packet), the buffer limit, or
+    /// another I/O error: stop reading ahead for the rest of this query and do
+    /// not report a disconnect.
     Stop,
 }
 
-/// Classify buffered bytes for read-ahead: `Some(Quit)`, `Some(Stop)`, or
-/// `None` when more bytes are needed to decide.
+/// Classify buffered bytes for read-ahead: `None` when the buffer is empty,
+/// otherwise `Quit` for a complete `COM_QUIT` packet at the head and `Stop` for
+/// anything else.
 fn classify_read_ahead(bytes: &[u8]) -> Option<ReadAhead> {
     // A COM_QUIT packet is exactly: length 1 (u24 LE), any sequence id, 0x01.
-    const QUIT_LEN: [u8; 3] = [0x01, 0x00, 0x00];
-    if bytes.len() < 3 {
-        return if QUIT_LEN.starts_with(bytes) {
-            None
-        } else {
-            Some(ReadAhead::Stop)
-        };
+    if bytes.is_empty() {
+        return None;
     }
-    if bytes[..3] != QUIT_LEN {
-        return Some(ReadAhead::Stop);
-    }
-    match bytes.get(4) {
-        None => None,
-        Some(0x01) => Some(ReadAhead::Quit),
-        Some(_) => Some(ReadAhead::Stop),
+    if bytes.len() >= 5 && bytes[..3] == [0x01, 0x00, 0x00] && bytes[4] == 0x01 {
+        Some(ReadAhead::Quit)
+    } else {
+        Some(ReadAhead::Stop)
     }
 }
 
@@ -209,7 +201,7 @@ impl<R: AsyncRead + Unpin> PacketReader<R> {
                 buf.extend_from_slice(&self.bytes);
                 buf.extend_from_slice(&chunk[..n]);
                 self.bytes = buf.freeze();
-                classify_read_ahead(&self.bytes).unwrap_or(ReadAhead::More)
+                classify_read_ahead(&self.bytes).unwrap_or(ReadAhead::Stop)
             }
             Err(e) => match e.kind() {
                 io::ErrorKind::ConnectionReset
@@ -548,18 +540,21 @@ mod read_ahead_tests {
     #[test]
     fn classify_read_ahead_only_reports_a_complete_quit() {
         assert_eq!(classify_read_ahead(&[]), None);
-        assert_eq!(classify_read_ahead(&[0x01]), None);
-        assert_eq!(classify_read_ahead(&[0x01, 0x00, 0x00, 0x00]), None);
         assert_eq!(
             classify_read_ahead(&[0x01, 0x00, 0x00, 0x00, 0x01]),
             Some(ReadAhead::Quit)
+        );
+        // An incomplete packet, even a possible COM_QUIT prefix, stops read-ahead.
+        assert_eq!(classify_read_ahead(&[0x01]), Some(ReadAhead::Stop));
+        assert_eq!(
+            classify_read_ahead(&[0x01, 0x00, 0x00, 0x00]),
+            Some(ReadAhead::Stop)
         );
         // COM_PING (0x0e) and a pipelined COM_QUERY are not a disconnect.
         assert_eq!(
             classify_read_ahead(&[0x01, 0x00, 0x00, 0x00, 0x0e]),
             Some(ReadAhead::Stop)
         );
-        assert_eq!(classify_read_ahead(&[0x09, 0x00]), Some(ReadAhead::Stop));
         assert_eq!(
             classify_read_ahead(&[0x09, 0x00, 0x00, 0x00, 0x03, b'S']),
             Some(ReadAhead::Stop)
