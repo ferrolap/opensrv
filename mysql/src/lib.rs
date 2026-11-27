@@ -1,4 +1,5 @@
 // Copyright 2021 Datafuse Labs.
+// Modified 2026 by the Ferrolap authors; see FERROLAP_FORK.md.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -511,9 +512,17 @@ where
                 let auth_plugin_expect = self.shim.auth_plugin_for_username(username).await;
 
                 // auth switch
+                //
+                // Ferrolap fork: also switch when a CLIENT_PLUGIN_AUTH client
+                // already answered for a different plugin (for example a MySQL
+                // 8.x client defaulting to caching_sha2_password). Upstream only
+                // switched when the first auth response was empty.
                 if !auth_plugin_expect.is_empty()
-                    && auth_response.is_empty()
                     && handshake.auth_plugin != auth_plugin_expect.as_bytes()
+                    && (auth_response.is_empty()
+                        || handshake
+                            .capabilities
+                            .contains(CapabilityFlags::CLIENT_PLUGIN_AUTH))
                 {
                     self.writer.set_seq(seq + 1);
                     self.writer.write_all(&[0xfe])?;
@@ -551,13 +560,20 @@ where
                     )
                     .await
                 {
+                    // Ferrolap fork: failed authentication is MySQL's
+                    // ER_ACCESS_DENIED_ERROR (1045 / 28000), not 1698. The text
+                    // is the same for unknown users and wrong passwords.
                     let err_msg = format!(
-                        "Authenticate failed, user: {:?}, auth_plugin: {:?}",
+                        "Access denied for user '{}' (using password: {})",
                         String::from_utf8_lossy(username),
-                        auth_plugin_expect,
+                        if auth_response.is_empty() {
+                            "NO"
+                        } else {
+                            "YES"
+                        },
                     );
                     writers::write_err(
-                        ErrorKind::ER_ACCESS_DENIED_NO_PASSWORD_ERROR,
+                        ErrorKind::ER_ACCESS_DENIED_ERROR,
                         err_msg.as_bytes(),
                         &mut self.writer,
                     )
@@ -783,10 +799,16 @@ where
                 Err(_) => {
                     // if parser err, we need also stay the conn,
                     // because we can not support all command.
-                    writers::write_ok_packet(
+                    //
+                    // Ferrolap fork: answer unrecognized commands (including
+                    // COM_CHANGE_USER, COM_RESET_CONNECTION and COM_PROCESS_KILL)
+                    // with ER_UNKNOWN_COM_ERROR (1047 / 08S01) instead of an OK
+                    // packet, so a client is never told an unsupported command
+                    // succeeded.
+                    writers::write_err(
+                        ErrorKind::ER_UNKNOWN_COM_ERROR,
+                        b"Unknown command",
                         &mut self.writer,
-                        self.client_capabilities,
-                        OkResponse::default(),
                     )
                     .await?;
                     self.writer.flush_all().await?;
