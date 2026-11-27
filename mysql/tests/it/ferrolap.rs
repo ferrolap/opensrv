@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, InitWriter, ParamParser, QueryResultWriter,
-    StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, InitWriter, ParamParser,
+    QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,6 +28,11 @@ use tokio::net::{TcpListener, TcpStream};
 const CLIENT_PROTOCOL_41: u32 = 1 << 9;
 const CLIENT_SECURE_CONNECTION: u32 = 1 << 15;
 const CLIENT_PLUGIN_AUTH: u32 = 1 << 19;
+const CLIENT_SSL: u32 = 1 << 11;
+const CLIENT_TRANSACTIONS: u32 = 1 << 13;
+const CLIENT_MULTI_STATEMENTS: u32 = 1 << 16;
+const CLIENT_MULTI_RESULTS: u32 = 1 << 17;
+const CLIENT_DEPRECATE_EOF: u32 = 1 << 24;
 
 /// Per-connection salt the shim hands out; differs from upstream's fixed salt.
 const SHIM_SALT: [u8; 20] = *b"ferrolap-test-salt-1";
@@ -374,4 +379,138 @@ async fn nul_terminated_other_plugin_is_still_switched() {
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1, vec![0x42; 20]);
+}
+
+fn greeting_capabilities(payload: &[u8]) -> u32 {
+    assert_eq!(payload[0], 10, "protocol version");
+    let version_end = payload[1..].iter().position(|&b| b == 0).expect("version");
+    // after version NUL: connection id (4), scramble #1 (8), filler (1),
+    // cap low (2), charset (1), status (2), cap high (2)
+    let i = 1 + version_end + 1 + 4 + 8 + 1;
+    let cap_low = u16::from_le_bytes([payload[i], payload[i + 1]]);
+    let cap_high = u16::from_le_bytes([payload[i + 5], payload[i + 6]]);
+    u32::from(cap_low) | (u32::from(cap_high) << 16)
+}
+
+#[tokio::test]
+async fn greeting_advertises_transaction_and_multi_statement_capabilities() {
+    let (port, _calls) = start().await;
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (_seq, payload) = read_packet(&mut stream).await;
+    let caps = greeting_capabilities(&payload);
+    assert_ne!(caps & CLIENT_TRANSACTIONS, 0);
+    assert_ne!(caps & CLIENT_MULTI_RESULTS, 0);
+    assert_ne!(caps & CLIENT_MULTI_STATEMENTS, 0);
+    assert_ne!(caps & CLIENT_DEPRECATE_EOF, 0);
+    assert_eq!(caps & CLIENT_SSL, 0);
+}
+
+struct QueryShim {
+    caps: Arc<Mutex<Option<CapabilityFlags>>>,
+}
+
+#[async_trait]
+impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryShim {
+    type Error = io::Error;
+
+    fn salt(&self) -> [u8; 20] {
+        SHIM_SALT
+    }
+
+    async fn authenticate(
+        &self,
+        _auth_plugin: &str,
+        _username: &[u8],
+        _salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        auth_data == [0x42; 20]
+    }
+
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _query: &'a str,
+        info: StatementMetaWriter<'a, W>,
+    ) -> io::Result<()> {
+        info.reply(1, &[], &[]).await
+    }
+
+    async fn on_execute<'a>(
+        &'a mut self,
+        _id: u32,
+        _params: ParamParser<'a>,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        results.completed(Default::default()).await
+    }
+
+    async fn on_close<'a>(&'a mut self, _stmt: u32)
+    where
+        W: 'async_trait,
+    {
+    }
+
+    async fn on_query<'a>(
+        &'a mut self,
+        _query: &'a str,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        *self.caps.lock().unwrap() = Some(results.client_capabilities());
+        results.completed(Default::default()).await
+    }
+
+    async fn on_init<'a>(
+        &'a mut self,
+        _schema: &'a str,
+        writer: InitWriter<'a, W>,
+    ) -> io::Result<()> {
+        writer.ok().await
+    }
+}
+
+async fn start_query_shim() -> (u16, Arc<Mutex<Option<CapabilityFlags>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let caps = Arc::new(Mutex::new(None));
+    let shim_caps = Arc::clone(&caps);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, write) = stream.into_split();
+        let _ = AsyncMysqlIntermediary::run_on(QueryShim { caps: shim_caps }, read, write).await;
+    });
+    (port, caps)
+}
+
+async fn query_after_login(port: u16, handshake_caps: u32) -> (u8, Vec<u8>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _greeting = read_packet(&mut stream).await;
+    let first = handshake_response_with(handshake_caps, "u", "mysql_native_password", &[0x42; 20]);
+    write_packet(&mut stream, 1, &first).await;
+    let (_seq, payload) = read_packet(&mut stream).await;
+    assert_eq!(payload[0], 0x00, "expected OK, got {payload:?}");
+    let mut body = vec![0x03]; // COM_QUERY
+    body.extend_from_slice(b"SELECT 1");
+    write_packet(&mut stream, 0, &body).await;
+    read_packet(&mut stream).await
+}
+
+#[tokio::test]
+async fn query_result_writer_exposes_client_capabilities() {
+    let base = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+
+    let (port, caps) = start_query_shim().await;
+    let _ = query_after_login(port, base).await;
+    let seen = caps.lock().unwrap().expect("on_query should run");
+    assert!(
+        !seen.contains(CapabilityFlags::CLIENT_MULTI_STATEMENTS),
+        "client did not declare MULTI_STATEMENTS: {seen:?}"
+    );
+
+    let (port, caps) = start_query_shim().await;
+    let _ = query_after_login(port, base | CLIENT_MULTI_STATEMENTS).await;
+    let seen = caps.lock().unwrap().expect("on_query should run");
+    assert!(
+        seen.contains(CapabilityFlags::CLIENT_MULTI_STATEMENTS),
+        "client declared MULTI_STATEMENTS: {seen:?}"
+    );
 }

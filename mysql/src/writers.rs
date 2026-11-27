@@ -110,10 +110,22 @@ pub async fn write_err<W: AsyncWrite + Unpin>(
     msg: &[u8],
     w: &mut PacketWriter<W>,
 ) -> io::Result<()> {
+    write_err_parts(err as u16, err.sqlstate(), msg, w).await
+}
+
+/// Write an ERR packet with an explicit errno and SQLSTATE.
+///
+/// `sqlstate` must be the five-character SQLSTATE (no leading `#`).
+pub async fn write_err_parts<W: AsyncWrite + Unpin>(
+    errno: u16,
+    sqlstate: &[u8],
+    msg: &[u8],
+    w: &mut PacketWriter<W>,
+) -> io::Result<()> {
     w.write_u8(0xFF)?;
-    w.write_u16::<LittleEndian>(err as u16)?;
+    w.write_u16::<LittleEndian>(errno)?;
     w.write_u8(b'#')?;
-    w.write_all(err.sqlstate())?;
+    w.write_all(sqlstate)?;
     w.write_all(msg)?;
     w.end_packet().await
 }

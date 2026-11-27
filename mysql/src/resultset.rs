@@ -162,6 +162,11 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     /// Note that if no columns are emitted, any written rows are ignored.
     ///
     /// See [`RowWriter`](struct.RowWriter.html).
+    /// Capability flags the client declared during the handshake.
+    pub fn client_capabilities(&self) -> CapabilityFlags {
+        self.client_capabilities
+    }
+
     pub async fn start<'b>(mut self, columns: &'b [Column]) -> io::Result<RowWriter<'a, 'b, W>> {
         self.finalize(true).await?;
         RowWriter::new(self, columns).await
@@ -187,12 +192,24 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
     }
 
     /// Reply to the client's query with an error.
-    pub async fn error<E>(mut self, kind: ErrorKind, msg: &E) -> io::Result<()>
+    pub async fn error<E>(self, kind: ErrorKind, msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]> + ?Sized,
+    {
+        self.error_with(kind as u16, kind.sqlstate(), msg).await
+    }
+
+    /// Reply to the client's query with an error using an explicit errno and SQLSTATE.
+    ///
+    /// `sqlstate` must be the five-character SQLSTATE (no leading `#`).
+    /// Used when the mapped MySQL code is not an [`ErrorKind`] variant
+    /// (for example timeout 3024).
+    pub async fn error_with<E>(mut self, errno: u16, sqlstate: &[u8], msg: &E) -> io::Result<()>
     where
         E: Borrow<[u8]> + ?Sized,
     {
         self.finalize(true).await?;
-        writers::write_err(kind, msg.borrow(), self.writer).await
+        writers::write_err_parts(errno, sqlstate, msg.borrow(), self.writer).await
     }
 
     /// Send the last bits of the last resultset to the client, and indicate that there are no more
@@ -440,12 +457,32 @@ impl<'a, 'b, W: AsyncWrite + Unpin + 'a> RowWriter<'a, 'b, W> {
     }
 
     /// End this resultset response, and indicate to the client there was an error.
-    pub async fn finish_error<E>(mut self, kind: ErrorKind, msg: &E) -> io::Result<()>
+    pub async fn finish_error<E>(self, kind: ErrorKind, msg: &E) -> io::Result<()>
+    where
+        E: Borrow<[u8]>,
+    {
+        self.finish_error_with(kind as u16, kind.sqlstate(), msg)
+            .await
+    }
+
+    /// End this resultset response with an error using an explicit errno and SQLSTATE.
+    ///
+    /// `sqlstate` must be the five-character SQLSTATE (no leading `#`).
+    pub async fn finish_error_with<E>(
+        mut self,
+        errno: u16,
+        sqlstate: &[u8],
+        msg: &E,
+    ) -> io::Result<()>
     where
         E: Borrow<[u8]>,
     {
         self.finish_inner("", false).await?;
 
-        self.result.take().unwrap().error(kind, msg).await
+        self.result
+            .take()
+            .unwrap()
+            .error_with(errno, sqlstate, msg)
+            .await
     }
 }

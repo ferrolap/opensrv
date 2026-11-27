@@ -10,7 +10,7 @@ Ferrolap pins this fork by git revision. Branches are based on upstream commit
 
 ## Changes on `ferrolap/m5-auth` (`opensrv-mysql` only)
 
-Modified files: `mysql/src/lib.rs`, `mysql/src/commands.rs`.
+Modified files: `mysql/src/lib.rs`, `mysql/src/commands.rs`, `mysql/src/resultset.rs`, `mysql/src/writers.rs`.
 
 1. Authentication failure is reported as `ER_ACCESS_DENIED_ERROR` (1045 / SQLSTATE 28000)
    with the text `Access denied for user '<user>' (using password: YES|NO)`, instead of
@@ -30,6 +30,19 @@ Modified files: `mysql/src/lib.rs`, `mysql/src/commands.rs`.
    `CLIENT_SECURE_CONNECTION`, consume the NUL that terminates the auth
    response before parsing the database and plugin fields. Otherwise the
    plugin name is read as empty and a native first packet is wrongly switched.
+
+
+4. Greeting capabilities (Ferrolap M5 P6 / architect Q5): the server greeting
+   also advertises `CLIENT_TRANSACTIONS`, `CLIENT_MULTI_RESULTS`, and
+   `CLIENT_MULTI_STATEMENTS`. `CLIENT_DEPRECATE_EOF` stays set; `CLIENT_SSL`
+   is still off when TLS is not configured. The default collation is unchanged
+   (still 33).
+   `QueryResultWriter::client_capabilities()` exposes the flags the client
+   declared, so the shim can reject a multi-statement `COM_QUERY` when the
+   client did not set `CLIENT_MULTI_STATEMENTS`.
+   `QueryResultWriter::error_with` / `RowWriter::finish_error_with` write an
+   ERR packet with an explicit errno and SQLSTATE, for mapped codes that are
+   not `ErrorKind` variants (for example timeout 3024).
 
 Tests for these changes: `mysql/tests/it/ferrolap.rs`
 (`cargo test -p opensrv-mysql --test it ferrolap`).
