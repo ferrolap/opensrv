@@ -475,7 +475,7 @@ impl<'a, 'b, W: AsyncWrite + Unpin + 'a> RowWriter<'a, 'b, W> {
         msg: &E,
     ) -> io::Result<()>
     where
-        E: Borrow<[u8]>,
+        E: Borrow<[u8]> + ?Sized,
     {
         self.finish_inner("", false).await?;
 
