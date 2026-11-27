@@ -157,16 +157,16 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         }
     }
 
-    /// Start a resultset response to the client that conforms to the given `columns`.
-    ///
-    /// Note that if no columns are emitted, any written rows are ignored.
-    ///
-    /// See [`RowWriter`](struct.RowWriter.html).
     /// Capability flags the client declared during the handshake.
     pub fn client_capabilities(&self) -> CapabilityFlags {
         self.client_capabilities
     }
 
+    /// Start a resultset response to the client that conforms to the given `columns`.
+    ///
+    /// Note that if no columns are emitted, any written rows are ignored.
+    ///
+    /// See [`RowWriter`](struct.RowWriter.html).
     pub async fn start<'b>(mut self, columns: &'b [Column]) -> io::Result<RowWriter<'a, 'b, W>> {
         self.finalize(true).await?;
         RowWriter::new(self, columns).await
