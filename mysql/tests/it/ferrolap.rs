@@ -514,3 +514,128 @@ async fn query_result_writer_exposes_client_capabilities() {
         "client declared MULTI_STATEMENTS: {seen:?}"
     );
 }
+
+/// Writes one OK, flushes it with `flush_pending_more`, then waits for the test
+/// before completing a second OK.
+struct FlushShim {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FlushShim {
+    type Error = io::Error;
+
+    fn salt(&self) -> [u8; 20] {
+        SHIM_SALT
+    }
+
+    async fn authenticate(
+        &self,
+        _auth_plugin: &str,
+        _username: &[u8],
+        _salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        auth_data == [0x42; 20]
+    }
+
+    async fn on_prepare<'a>(
+        &'a mut self,
+        _query: &'a str,
+        info: StatementMetaWriter<'a, W>,
+    ) -> io::Result<()> {
+        info.reply(1, &[], &[]).await
+    }
+
+    async fn on_execute<'a>(
+        &'a mut self,
+        _id: u32,
+        _params: ParamParser<'a>,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        results.completed(Default::default()).await
+    }
+
+    async fn on_close<'a>(&'a mut self, _stmt: u32)
+    where
+        W: 'async_trait,
+    {
+    }
+
+    async fn on_query<'a>(
+        &'a mut self,
+        _query: &'a str,
+        results: QueryResultWriter<'a, W>,
+    ) -> io::Result<()> {
+        let mut results = results
+            .complete_one(opensrv_mysql::OkResponse {
+                affected_rows: 1,
+                ..Default::default()
+            })
+            .await?;
+        results.flush_pending_more().await?;
+        self.release.notified().await;
+        results
+            .completed(opensrv_mysql::OkResponse {
+                affected_rows: 2,
+                ..Default::default()
+            })
+            .await
+    }
+
+    async fn on_init<'a>(
+        &'a mut self,
+        _schema: &'a str,
+        writer: InitWriter<'a, W>,
+    ) -> io::Result<()> {
+        writer.ok().await
+    }
+}
+
+#[tokio::test]
+async fn flush_pending_more_sends_the_previous_terminator_immediately() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let shim_release = Arc::clone(&release);
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, write) = stream.into_split();
+        let shim = FlushShim {
+            release: shim_release,
+        };
+        let _ = AsyncMysqlIntermediary::run_on(shim, read, write).await;
+    });
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let _greeting = read_packet(&mut stream).await;
+    let caps = CLIENT_PROTOCOL_41
+        | CLIENT_SECURE_CONNECTION
+        | CLIENT_PLUGIN_AUTH
+        | CLIENT_MULTI_STATEMENTS
+        | CLIENT_MULTI_RESULTS;
+    let first = handshake_response_with(caps, "u", "mysql_native_password", &[0x42; 20]);
+    write_packet(&mut stream, 1, &first).await;
+    let (_seq, payload) = read_packet(&mut stream).await;
+    assert_eq!(payload[0], 0x00);
+
+    let mut body = vec![0x03];
+    body.extend_from_slice(b"a; b");
+    write_packet(&mut stream, 0, &body).await;
+    // The shim is blocked until release, so this OK must have been flushed early.
+    let (_seq, ok1) =
+        tokio::time::timeout(std::time::Duration::from_secs(2), read_packet(&mut stream))
+            .await
+            .expect("first OK must arrive before the shim finishes");
+    assert_eq!(ok1[0], 0x00);
+    assert_eq!(ok1[1], 1, "affected rows of the first result");
+    let status = u16::from_le_bytes([ok1[3], ok1[4]]);
+    assert_ne!(status & 0x0008, 0, "SERVER_MORE_RESULTS_EXISTS");
+
+    release.notify_one();
+    let (_seq, ok2) = read_packet(&mut stream).await;
+    assert_eq!(ok2[0], 0x00);
+    assert_eq!(ok2[1], 2);
+    let status = u16::from_le_bytes([ok2[3], ok2[4]]);
+    assert_eq!(status & 0x0008, 0);
+}

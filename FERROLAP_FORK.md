@@ -43,6 +43,9 @@ Modified files: `mysql/src/lib.rs`, `mysql/src/commands.rs`, `mysql/src/resultse
    `QueryResultWriter::error_with` / `RowWriter::finish_error_with` write an
    ERR packet with an explicit errno and SQLSTATE, for mapped codes that are
    not `ErrorKind` variants (for example timeout 3024).
+   `QueryResultWriter::flush_pending_more` writes the deferred terminator of the
+   previous resultset immediately (with `SERVER_MORE_RESULTS_EXISTS`), so a
+   multi-statement batch sees a write failure before running the next statement.
 
 Tests for these changes: `mysql/tests/it/ferrolap.rs`
 (`cargo test -p opensrv-mysql --test it ferrolap`).

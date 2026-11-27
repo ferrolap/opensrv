@@ -162,6 +162,18 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         self.client_capabilities
     }
 
+    /// Write the terminator (OK or EOF) of the previous resultset now, marked with
+    /// `SERVER_MORE_RESULTS_EXISTS`.
+    ///
+    /// Terminators are normally deferred until the next resultset starts. Call this
+    /// when another resultset is known to follow, so that a write failure surfaces
+    /// before the caller does more work for the next resultset. Does nothing if no
+    /// terminator is pending.
+    pub async fn flush_pending_more(&mut self) -> io::Result<()> {
+        self.finalize(true).await?;
+        self.writer.flush_all().await
+    }
+
     /// Start a resultset response to the client that conforms to the given `columns`.
     ///
     /// Note that if no columns are emitted, any written rows are ignored.
